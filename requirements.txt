@@ -1,0 +1,8 @@
+# NextRun — pinned for reproducibility. Python 3.11+ (dev/test on 3.12.3).
+# scikit-learn>=1.7 REQUIRED: GPC latent_mean_and_variance / stable predict_proba.
+numpy>=2.0,<3.0
+scipy>=1.13,<2.0
+scikit-learn>=1.7,<2.0
+pytest>=8.0
+pyyaml>=6.0
+pandas>=2.0
