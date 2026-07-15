@@ -9,7 +9,8 @@ wrapper exposes latent variance only as a secondary diagnostic
 
 Cold-start guard: with a tiny labeled set (e.g. 10 seed trials) the labels are
 often single-class. Both wrappers detect this in fit() and fall back to a
-maximally-uncertain prior: predict_proba = [0.5, 0.5], uncertainty = 1.0.
+maximally-uncertain prior: predict_proba = [0.5, 0.5], uncertainty = ln(2)
+(the entropy of p=0.5, i.e. the maximum of the declared uncertainty measure).
 They must never crash on single-class data.
 
 Inputs are assumed already normalized to [0,1] by features.py.
@@ -62,7 +63,9 @@ class _ColdStartMixin:
         return np.full((n, 2), 0.5)
 
     def _cold_uncertainty(self, X: np.ndarray) -> np.ndarray:
-        return np.ones(np.asarray(X).shape[0])
+        # entropy at p=0.5 is ln(2) — the max of the declared uncertainty
+        # measure, so cold-start uncertainty stays on the same scale
+        return np.full(np.asarray(X).shape[0], np.log(2.0))
 
     @property
     def is_cold(self) -> bool:

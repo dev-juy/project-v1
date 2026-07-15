@@ -1,5 +1,5 @@
 """
-Round-trip identifiability test for simulator calibration (v4.1).
+Round-trip identifiability tests for simulator calibration (v4.1).
 
 Generate synthetic calibration data from a KNOWN SimParams with nonzero
 positive error slopes, then fit and assert the five required properties:
@@ -10,10 +10,17 @@ positive error slopes, then fit and assert the five required properties:
   4. path-margin scale and bias recovered
   5. p_success differs across scenarios (discrimination)
 
+Path-calibration rows log RAW terminal pose (Decision B); errors and margins
+are computed at ingest by the fitter. The synthetic path runs deliberately
+VARY their binding axis (position / heading / duration bound) per Decision A —
+the scalar margin fit must work across mixed axes, and the fitter reports
+binding-axis agreement, residuals, RMSE, and R^2 as diagnostics rather than
+constraining the scenarios.
+
 The p_success check verifies DISCRIMINATION under known nonzero slopes; it does
 NOT enforce universal monotonicity on real fitted data.
 
-If the fit cannot recover the slopes or path-margin params, the test fails and
+If the fit cannot recover the slopes or path-margin params, the tests fail and
 we stop and report an identifiability failure.
 """
 
@@ -28,9 +35,9 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from nextrun.simulator import (
-    SimParams, Simulator, POWER_LOW, POWER_HIGH, failure_margin,
+    SimParams, Simulator, POWER_LOW, POWER_HIGH, failure_margin, binding_axis,
 )
-from nextrun.calibrate import fit_simulator
+from nextrun.calibrate import fit_simulator, _fit_noise, validate_calibration_data
 
 
 TASK_CFG = {
@@ -63,12 +70,15 @@ PRIM_SPECS = [
     ("turn", 0.0, 45.0), ("turn", 0.0, 135.0),
 ]
 
-# Path poses spanning easy->hard; each repeated twice (6 runs).
+# Path poses spanning easy -> near-boundary, each with a DIFFERENT axis binding
+# the real margin (Decision A: vary translation and heading; do not constrain
+# poses to be position-dominant).
 PATH_POSES = [
-    (66.0, 72.0, 0.0, 0.5),    # easy: 6in translation, no turn
+    (66.0, 72.0, 0.0, 0.5),    # easy
     (60.0, 64.0, 20.0, 0.5),   # medium
-    (52.0, 56.0, 45.0, 0.7),   # hard: large translation + turn
+    (52.0, 56.0, 45.0, 0.7),   # near-boundary
 ]
+PATH_BIND_AXES = ["position", "heading", "duration"]
 
 
 def make_primitive_rows(params: SimParams, rng=None) -> list[dict]:
@@ -90,42 +100,50 @@ def make_primitive_rows(params: SimParams, rng=None) -> list[dict]:
 
 
 def make_path_rows(params: SimParams, rng=None, reps=2) -> list[dict]:
-    """Path-calib runs modelling a genuine sim-to-real margin gap.
+    """Synthetic path-calibration runs logging RAW terminal pose (Decision B).
 
-    The PHYSICAL robot's terminal margin is the primitive-predicted margin
-    transformed by the true path scale/bias (that IS the sim-to-real gap we
-    want stage 4 to recover). We must therefore store COMPONENT errors whose
-    margin equals that corrected value -- otherwise the fitter recomputes the
-    uncorrected margin from the components and the scale collapses to 1.0.
-
-    We inflate the position error so that the resulting margin equals the
-    corrected margin. (Heading/duration held; position is the dominant axis
-    here.) This makes real_margin = scale*sim_margin + bias reconstructable
-    from stored components, matching clarification #1.
+    Generative model of the "real robot": its terminal margin is the primitive
+    prediction transformed by the true path scale/bias (that IS the sim-to-real
+    gap stage 4 must recover), realized on a per-pose BINDING AXIS so the six
+    runs mix position-, heading-, and duration-bound failures (Decision A).
+    Gaussian pose noise (params' true stds) is added on top when rng is given,
+    which is what stage 3 estimates from the repeats.
     """
-    # primitive-only sim = params with identity path correction
     prim_params = SimParams.from_dict(
         {**params.to_dict(), "path_margin_scale": 1.0, "path_margin_bias": 0.0})
     prim_sim = Simulator(prim_params, TASK_CFG)
-    pos_t = TASK_CFG["task"]["success"]["position_error_in_max"]
+    s = TASK_CFG["task"]["success"]
+    tx, ty, th = prim_sim.target
 
     rows = []
     i = 0
-    for sx, sy, sh, pw in PATH_POSES:
+    for (sx, sy, sh, pw), axis in zip(PATH_POSES, PATH_BIND_AXES):
+        base = prim_sim.simulate_trial(sx, sy, sh, pw, rng=None)
+        m1 = params.path_margin_scale * base.margin + params.path_margin_bias
+        # realize margin m1 on the chosen axis; keep other axes at 0.3*m1
+        # (base duration ratio is <= base.margin < m1, so it never binds)
+        if axis == "position":
+            pos_err, hdg_err, dur = m1 * s["position_error_in_max"], \
+                0.3 * m1 * s["heading_error_deg_max"], base.duration_s
+        elif axis == "heading":
+            pos_err, hdg_err, dur = 0.3 * m1 * s["position_error_in_max"], \
+                m1 * s["heading_error_deg_max"], base.duration_s
+        else:  # duration
+            pos_err, hdg_err, dur = 0.3 * m1 * s["position_error_in_max"], \
+                0.3 * m1 * s["heading_error_deg_max"], m1 * s["duration_s_max"]
+
         for _ in range(reps):
-            base = prim_sim.simulate_trial(sx, sy, sh, pw, rng=rng)
-            sim_margin = base.margin
-            real_margin = params.path_margin_scale * sim_margin + params.path_margin_bias
-            # choose a position error that realizes real_margin on the pos axis,
-            # provided pos is the binding axis (it is for these poses).
-            real_pos_err = real_margin * pos_t
+            fx, fy, fh = tx + pos_err, ty, th + hdg_err
+            if rng is not None:
+                fx += rng.normal(0.0, params.position_noise_std_in)
+                fy += rng.normal(0.0, params.position_noise_std_in)
+                fh += rng.normal(0.0, params.heading_noise_std_deg)
             rows.append({
                 "trial_uid": f"path_{i}",
                 "start_x_in": sx, "start_y_in": sy,
                 "start_heading_deg": sh, "max_power": pw,
-                "position_error_in": real_pos_err,
-                "heading_error_deg": base.heading_error_deg,
-                "duration_s": base.duration_s,
+                "final_x_in": fx, "final_y_in": fy,
+                "final_heading_deg": fh, "duration_s": dur,
             })
             i += 1
     return rows
@@ -161,7 +179,7 @@ def test_round_trip():
     assert np.ptp(margins) > 0.05, \
         f"(3) simulated margins ~constant: {margins}"
 
-    # (4) path-margin scale and bias
+    # (4) path-margin scale and bias, across MIXED binding axes
     assert diag["stage4_path"]["_path_fit_ok"], "(4) path margin fit did not run"
     assert fitted.path_margin_scale == pytest.approx(TRUE.path_margin_scale, rel=1e-3), \
         f"(4) path_margin_scale: {fitted.path_margin_scale} vs {TRUE.path_margin_scale}"
@@ -230,3 +248,148 @@ def test_zero_magnitude_zero_error():
     sim = Simulator(TRUE, TASK_CFG)
     out = sim.simulate_calibration("forward", 0.0, 0.0, 0.5, rng=None)
     assert out["dx"] == pytest.approx(0.0)
+
+
+# --------------------------------------------------------------------------- #
+# Patch 1 regressions: per-axis signed error components, never averaged
+# --------------------------------------------------------------------------- #
+def test_axis_slopes_not_averaged():
+    """Anisotropic slopes must survive into simulate_trial: a pure-x approach
+    uses ONLY the forward slope, a pure-y approach ONLY the strafe slope.
+    (The old isotropic model averaged them, giving 0.05*20=1.0 for both.)"""
+    p = SimParams.from_dict({**TRUE.to_dict(),
+                             "forward_error_per_in": 0.1,
+                             "strafe_error_per_in": 0.0,
+                             "path_margin_scale": 1.0, "path_margin_bias": 0.0})
+    sim = Simulator(p, TASK_CFG)
+    rx = sim.simulate_trial(72.0 - 20.0, 72.0, 0.0, 0.5, rng=None)
+    ry = sim.simulate_trial(72.0, 72.0 - 20.0, 0.0, 0.5, rng=None)
+    assert rx.position_error_in == pytest.approx(0.1 * 20.0)
+    assert ry.position_error_in == pytest.approx(0.0)
+
+
+def test_signed_error_components_preserved():
+    """Sign must be kept per component: a negative (overshoot) forward slope
+    lands PAST the target on x; a positive turn slope undershoots the heading
+    in the direction of the commanded turn."""
+    p = SimParams.from_dict({**TRUE.to_dict(),
+                             "forward_error_per_in": -0.05,
+                             "path_margin_scale": 1.0, "path_margin_bias": 0.0})
+    sim = Simulator(p, TASK_CFG)
+    r = sim.simulate_trial(72.0 - 20.0, 72.0, 0.0, 0.5, rng=None)
+    assert r.final_x_in == pytest.approx(73.0)  # 72 - (-0.05*20)
+    assert r.final_x_in > 72.0
+
+    # commanded turn of +40deg (start_heading -40 -> target 0), slope 0.04:
+    # heading falls short by 1.6deg on the same side as the turn
+    r2 = sim.simulate_trial(72.0 - 10.0, 72.0, -40.0, 0.5, rng=None)
+    assert r2.final_heading_deg == pytest.approx(-1.6)
+
+
+# --------------------------------------------------------------------------- #
+# Patch 2 regression: noise from SIGNED residuals, not absolute magnitudes
+# --------------------------------------------------------------------------- #
+def test_noise_from_signed_residuals_not_abs():
+    """Finals landing symmetrically about the group mean have CONSTANT absolute
+    error — the old abs-magnitude estimator reported ~zero noise for them. The
+    signed-residual estimator must see the real spread."""
+    rows = []
+    for g, (sx, sy, sh, pw) in enumerate(PATH_POSES):
+        for sign in (+1.0, -1.0):
+            rows.append({
+                "trial_uid": f"n_{g}_{sign}",
+                "start_x_in": sx, "start_y_in": sy,
+                "start_heading_deg": sh, "max_power": pw,
+                "final_x_in": 72.0 + sign * 0.5,   # |x error| constant 0.5
+                "final_y_in": 72.0,
+                "final_heading_deg": sign * 1.0,   # |heading error| constant 1.0
+                "duration_s": 1.0,
+            })
+    noise = _fit_noise(rows)
+    # x devs +-0.5 (ss=0.5/group), y flat: pooled = sqrt(3*0.5 / 6) = 0.5
+    assert noise["position_noise_std_in"] == pytest.approx(0.5, rel=1e-6)
+    # heading devs +-1.0 (ss=2.0/group): sqrt(3*2.0 / 3) = sqrt(2)
+    assert noise["heading_noise_std_deg"] == pytest.approx(np.sqrt(2.0), rel=1e-6)
+    assert noise["_noise_groups_used"] == 3
+
+
+# --------------------------------------------------------------------------- #
+# Patch 3 regressions: varied binding axes + Decision-A diagnostics
+# --------------------------------------------------------------------------- #
+def test_path_margin_diagnostics_varied_axes():
+    prim = make_primitive_rows(TRUE, rng=None)
+    path = make_path_rows(TRUE, rng=None, reps=2)
+    _, diag = fit_simulator(prim, path, TASK_CFG, seed=0)
+    d = diag["stage4_path"]
+
+    # the six real runs mix binding axes — all three axes appear
+    counts = d["real_binding_axis_counts"]
+    assert sum(counts.values()) == 6
+    assert counts == {"position": 2, "heading": 2, "duration": 2}
+    assert set(d["sim_binding_axis_counts"]) == {"position", "heading", "duration"}
+    assert 0 <= d["binding_axis_matches"] <= 6
+
+    # fit-quality diagnostics are reported; noise-free synthetic fit is exact
+    assert len(d["residuals"]) == 6
+    assert d["rmse"] < 1e-9
+    assert d["r2"] > 0.999
+    assert d["sim_margin_spread"] > 0.05
+
+
+def test_binding_axis_helper():
+    assert binding_axis(4.0, 0.0, 0.0, TASK_CFG) == "position"
+    assert binding_axis(0.0, 8.0, 0.0, TASK_CFG) == "heading"
+    assert binding_axis(0.4, 0.8, 5.9, TASK_CFG) == "duration"
+
+
+# --------------------------------------------------------------------------- #
+# Patch 5 regressions: validation raises actionable errors, no silent defaults
+# --------------------------------------------------------------------------- #
+def test_incomplete_primitive_matrix_raises():
+    prim = [r for r in make_primitive_rows(TRUE)
+            if not (r["movement_type"] == "forward"
+                    and r["commanded_distance_in"] == 36.0)]
+    with pytest.raises(ValueError, match="forward.*need 2 distinct magnitudes"):
+        fit_simulator(prim, make_path_rows(TRUE), TASK_CFG)
+
+
+def test_unrepeated_path_pose_raises():
+    path = make_path_rows(TRUE, reps=1)
+    with pytest.raises(ValueError, match="repetitions"):
+        fit_simulator(make_primitive_rows(TRUE), path, TASK_CFG)
+
+
+def test_too_few_path_poses_raises():
+    path = [r for r in make_path_rows(TRUE)
+            if float(r["start_x_in"]) != PATH_POSES[2][0]]
+    with pytest.raises(ValueError, match="difficulty levels"):
+        fit_simulator(make_primitive_rows(TRUE), path, TASK_CFG)
+
+
+def test_missing_raw_pose_fields_raises():
+    path = make_path_rows(TRUE)
+    for r in path:
+        del r["final_x_in"]
+    with pytest.raises(ValueError, match="raw-pose fields"):
+        validate_calibration_data(make_primitive_rows(TRUE), path)
+
+
+def test_degenerate_margin_spread_raises():
+    """Three valid, repeated poses whose PREDICTED margins are nearly equal
+    (same 6in offset from target) leave the scale unidentifiable — the fitter
+    must raise with the measured spread, not silently return identity."""
+    prim = make_primitive_rows(TRUE)
+    degenerate_poses = [(78.0, 72.0, 0.0, 0.5), (66.0, 72.0, 0.0, 0.5),
+                        (72.0, 66.0, 0.0, 0.5)]
+    path = []
+    for g, (sx, sy, sh, pw) in enumerate(degenerate_poses):
+        for rep in range(2):
+            path.append({
+                "trial_uid": f"deg_{g}_{rep}",
+                "start_x_in": sx, "start_y_in": sy,
+                "start_heading_deg": sh, "max_power": pw,
+                "final_x_in": 72.4, "final_y_in": 72.0,
+                "final_heading_deg": 0.5, "duration_s": 0.3,
+            })
+    with pytest.raises(ValueError, match="unidentifiable"):
+        fit_simulator(prim, path, TASK_CFG)

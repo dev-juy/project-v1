@@ -12,13 +12,16 @@ Earlier the terminal error was a constant bias, which made simulated margins
 nearly identical across scenarios -> path-margin unidentifiable and Method E's
 p_success signal flat. Now:
 
-    forward displacement error  = forward_error_per_in * distance
-    strafe  displacement error  = strafe_error_per_in  * distance
-    heading error               = turn_error_per_deg   * |heading_change|
+    x displacement error (signed) = forward_error_per_in * dx_commanded
+    y displacement error (signed) = strafe_error_per_in  * dy_commanded
+    heading error       (signed)  = turn_error_per_deg   * heading_change
 
-Errors pass through the origin (zero commanded magnitude -> zero error) so each
-slope is a single identifiable parameter. Slopes are FIT from data and may be
-any sign; nothing here forces positive slopes or monotonic difficulty.
+Error components are SIGNED and kept PER AXIS — forward and strafe slopes are
+never averaged, so anisotropy between the two translation axes survives into
+diagonal moves. Errors pass through the origin (zero commanded magnitude ->
+zero error) so each slope is a single identifiable parameter. Slopes are FIT
+from data and may be any sign; nothing here forces positive slopes or
+monotonic difficulty.
 
 Conventions
 -----------
@@ -116,6 +119,20 @@ def failure_margin(position_error_in: float,
     )
 
 
+def binding_axis(position_error_in: float,
+                 heading_error_deg: float,
+                 duration_s: float,
+                 task_cfg: dict) -> str:
+    """Which axis binds the margin: argmax of (value / threshold)."""
+    s = task_cfg["task"]["success"]
+    ratios = {
+        "position": position_error_in / s["position_error_in_max"],
+        "heading": heading_error_deg / s["heading_error_deg_max"],
+        "duration": duration_s / s["duration_s_max"],
+    }
+    return max(ratios, key=ratios.get)
+
+
 class Simulator:
     def __init__(self, params: SimParams, task_cfg: dict):
         self.p = params
@@ -197,13 +214,18 @@ class Simulator:
         rot_time = abs(dtheta) / rate if rate > 0 else 0.0
         duration = trans_time + rot_time
 
-        trans_slope = 0.5 * (self.p.forward_error_per_in + self.p.strafe_error_per_in)
-        pos_err_mag = trans_slope * dist
-        hdg_err_mag = self.p.turn_error_per_deg * abs(dtheta)
+        # Signed per-axis error components, matching the primitive shortfall
+        # model (actual = commanded - slope*commanded). The x displacement uses
+        # the forward slope, the y displacement the strafe slope — they are NOT
+        # averaged, so anisotropy between forward and strafe is preserved and
+        # a diagonal move gets each axis's own error.
+        err_x = self.p.forward_error_per_in * ddx
+        err_y = self.p.strafe_error_per_in * ddy
+        err_h = self.p.turn_error_per_deg * dtheta
 
-        fx = tx + pos_err_mag
-        fy = ty
-        fh = th + (math.copysign(hdg_err_mag, dtheta) if dtheta != 0 else 0.0)
+        fx = tx - err_x
+        fy = ty - err_y
+        fh = th - err_h
 
         if rng is not None:
             fx += rng.normal(0.0, self.p.position_noise_std_in)

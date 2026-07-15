@@ -55,7 +55,11 @@ def test_cold_start_single_class(name, label):
     m.fit(X, y)  # must not crash
     P = m.predict_proba(X)
     np.testing.assert_array_equal(P, np.full((10, 2), 0.5))
-    np.testing.assert_array_equal(m.uncertainty(X), np.ones(10))
+    # cold-start uncertainty is ln(2) — the entropy of p=0.5, NOT 1.0, so it
+    # stays on the same scale as the declared measure and can never outrank
+    # a warm prediction by unit mismatch
+    np.testing.assert_allclose(m.uncertainty(X), np.full(10, LN2))
+    assert np.all(m.uncertainty(X) <= LN2 + 1e-12)
 
 
 @pytest.mark.parametrize("name", ["logreg", "gpc"])
