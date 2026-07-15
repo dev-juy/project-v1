@@ -286,6 +286,41 @@ def test_signed_error_components_preserved():
     assert r2.final_heading_deg == pytest.approx(-1.6)
 
 
+def test_translation_duration_anisotropic():
+    """Equal-distance pure-forward and pure-strafe moves must take DIFFERENT
+    times when the axis speeds differ — in both translation modes. (The old
+    model averaged the speeds, giving identical durations.)"""
+    # TRUE at power 0.4: forward 24 in/s, strafe 18 in/s
+    pp = Simulator(TRUE, TASK_CFG)  # pose_to_pose default
+    fwd = pp.simulate_trial(72.0 - 20.0, 72.0, 0.0, POWER_LOW, rng=None)
+    stf = pp.simulate_trial(72.0, 72.0 - 20.0, 0.0, POWER_LOW, rng=None)
+    assert fwd.duration_s == pytest.approx(20.0 / 24.0)
+    assert stf.duration_s == pytest.approx(20.0 / 18.0)
+    assert fwd.duration_s != pytest.approx(stf.duration_s)
+
+    seq = Simulator(TRUE, TASK_CFG, translation_mode="sequential")
+    fwd_s = seq.simulate_trial(72.0 - 20.0, 72.0, 0.0, POWER_LOW, rng=None)
+    stf_s = seq.simulate_trial(72.0, 72.0 - 20.0, 0.0, POWER_LOW, rng=None)
+    assert fwd_s.duration_s == pytest.approx(20.0 / 24.0)
+    assert stf_s.duration_s == pytest.approx(20.0 / 18.0)
+
+
+def test_translation_modes_diagonal():
+    """Diagonal move: sequential sums per-axis times; pose_to_pose uses the
+    elliptical envelope (quadrature), which is strictly faster."""
+    diag_pose = (72.0 - 12.0, 72.0 - 9.0, 0.0, POWER_LOW)  # dx=12, dy=9
+    seq = Simulator(TRUE, TASK_CFG, translation_mode="sequential")
+    pp = Simulator(TRUE, TASK_CFG, translation_mode="pose_to_pose")
+    d_seq = seq.simulate_trial(*diag_pose, rng=None).duration_s
+    d_pp = pp.simulate_trial(*diag_pose, rng=None).duration_s
+    assert d_seq == pytest.approx(12.0 / 24.0 + 9.0 / 18.0)
+    assert d_pp == pytest.approx(np.hypot(12.0 / 24.0, 9.0 / 18.0))
+    assert d_pp < d_seq
+
+    with pytest.raises(ValueError, match="translation_mode"):
+        Simulator(TRUE, TASK_CFG, translation_mode="teleport")
+
+
 # --------------------------------------------------------------------------- #
 # Patch 2 regression: noise from SIGNED residuals, not absolute magnitudes
 # --------------------------------------------------------------------------- #
@@ -349,7 +384,18 @@ def test_incomplete_primitive_matrix_raises():
     prim = [r for r in make_primitive_rows(TRUE)
             if not (r["movement_type"] == "forward"
                     and r["commanded_distance_in"] == 36.0)]
-    with pytest.raises(ValueError, match="forward.*need 2 distinct magnitudes"):
+    with pytest.raises(ValueError, match="forward.*missing frozen magnitude"):
+        fit_simulator(prim, make_path_rows(TRUE), TASK_CFG)
+
+
+def test_wrong_magnitude_rejected_even_if_distinct():
+    """Two distinct magnitudes are NOT enough — the matrix is frozen at
+    12&36in / 45&135deg. A 24in run in place of 36in must be rejected."""
+    prim = make_primitive_rows(TRUE)
+    for r in prim:
+        if r["movement_type"] == "forward" and r["commanded_distance_in"] == 36.0:
+            r["commanded_distance_in"] = 24.0
+    with pytest.raises(ValueError, match="frozen"):
         fit_simulator(prim, make_path_rows(TRUE), TASK_CFG)
 
 

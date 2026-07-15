@@ -23,6 +23,11 @@ zero error) so each slope is a single identifiable parameter. Slopes are FIT
 from data and may be any sign; nothing here forces positive slopes or
 monotonic difficulty.
 
+Translation DURATION is also anisotropic (see Simulator.TRANSLATION_MODES):
+the default "pose_to_pose" branch uses an elliptical speed-envelope
+approximation hypot(dx/forward_speed, dy/strafe_speed); the "sequential"
+branch (Path B fallback) sums the per-axis times.
+
 Conventions
 -----------
 Field frame: x right, y up, heading degrees CCW from +x. Calibration primitives
@@ -134,9 +139,31 @@ def binding_axis(position_error_in: float,
 
 
 class Simulator:
-    def __init__(self, params: SimParams, task_cfg: dict):
+    # How translation duration is modeled (forward/strafe anisotropy is
+    # preserved in BOTH branches — the speeds are never averaged):
+    #
+    #   "pose_to_pose" (default, Path A): the holonomic controller drives both
+    #     axes simultaneously toward the target. Duration uses the ELLIPTICAL
+    #     SPEED-ENVELOPE approximation, hypot(dx/forward_speed,
+    #     dy/strafe_speed): the drive's max velocity traces an axis-aligned
+    #     ellipse with radii (forward_speed, strafe_speed), so straight-line
+    #     speed along direction theta is 1/sqrt((cos/vf)^2 + (sin/vs)^2).
+    #     Exact for pure-axis moves; a stated approximation for diagonals.
+    #
+    #   "sequential" (Path B, primitive-composite fallback): axes run one
+    #     after another, so durations add:
+    #     abs(dx)/forward_speed + abs(dy)/strafe_speed.
+    TRANSLATION_MODES = ("pose_to_pose", "sequential")
+
+    def __init__(self, params: SimParams, task_cfg: dict,
+                 translation_mode: str = "pose_to_pose"):
+        if translation_mode not in self.TRANSLATION_MODES:
+            raise ValueError(
+                f"unknown translation_mode: {translation_mode!r} "
+                f"(expected one of {self.TRANSLATION_MODES})")
         self.p = params
         self.task_cfg = task_cfg
+        self.translation_mode = translation_mode
         t = task_cfg["task"]["target"]
         self.target = (float(t["x_in"]), float(t["y_in"]), float(t["heading_deg"]))
 
@@ -204,10 +231,15 @@ class Simulator:
 
         ddx = tx - start_x
         ddy = ty - start_y
-        dist = math.hypot(ddx, ddy)
 
-        v = 0.5 * (self.forward_speed(max_power) + self.strafe_speed(max_power))
-        trans_time = dist / v if v > 0 else 0.0
+        vf = self.forward_speed(max_power)
+        vs = self.strafe_speed(max_power)
+        tx_time = abs(ddx) / vf if vf > 0 else 0.0
+        ty_time = abs(ddy) / vs if vs > 0 else 0.0
+        if self.translation_mode == "sequential":
+            trans_time = tx_time + ty_time
+        else:  # pose_to_pose: elliptical speed-envelope (see class docstring)
+            trans_time = math.hypot(tx_time, ty_time)
 
         dtheta = wrap_to_180(th - start_heading)
         rate = self.turn_rate(max_power)

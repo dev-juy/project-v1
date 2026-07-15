@@ -46,6 +46,15 @@ from .simulator import (
 # runs for the scale/bias regression to be identifiable.
 MIN_MARGIN_SPREAD = 0.05
 
+# The frozen calibration cells (preregistered; validation requires EXACTLY
+# these magnitudes at each power, not just any two distinct values).
+FROZEN_MAGNITUDES = {
+    "forward": (12.0, 36.0),   # inches
+    "strafe": (12.0, 36.0),    # inches
+    "turn": (45.0, 135.0),     # degrees
+}
+MAGNITUDE_TOL = 0.1
+
 
 def _rows(data) -> list[dict]:
     if hasattr(data, "to_dict"):
@@ -89,8 +98,9 @@ def validate_calibration_data(prim: list[dict], path: list[dict]) -> None:
     problems = []
 
     for mtype in ("forward", "strafe", "turn"):
+        expected = FROZEN_MAGNITUDES[mtype]
         for power in (POWER_LOW, POWER_HIGH):
-            mags = set()
+            found = set()
             for r in prim:
                 if r.get("movement_type") != mtype:
                     continue
@@ -98,11 +108,21 @@ def validate_calibration_data(prim: list[dict], path: list[dict]) -> None:
                     continue
                 mag = (abs(float(r["commanded_angle_deg"])) if mtype == "turn"
                        else abs(float(r["commanded_distance_in"])))
-                mags.add(round(mag, 3))
-            if len(mags) < 2:
+                found.add(round(mag, 3))
+            missing = [m for m in expected
+                       if not any(abs(f - m) <= MAGNITUDE_TOL for f in found)]
+            unexpected = [f for f in sorted(found)
+                          if not any(abs(f - m) <= MAGNITUDE_TOL for m in expected)]
+            if missing:
                 problems.append(
-                    f"primitive matrix incomplete: {mtype} @ power {power} has "
-                    f"magnitudes {sorted(mags) or '{}'} — need 2 distinct magnitudes")
+                    f"primitive matrix incomplete: {mtype} @ power {power} "
+                    f"missing frozen magnitude(s) {missing} "
+                    f"(found {sorted(found) or '{}'})")
+            if unexpected:
+                problems.append(
+                    f"primitive matrix off-spec: {mtype} @ power {power} has "
+                    f"unexpected magnitude(s) {unexpected} — the matrix is "
+                    f"frozen at {expected}")
 
     groups = _group_path(path)
     if len(groups) < 3:
@@ -127,9 +147,9 @@ def validate_calibration_data(prim: list[dict], path: list[dict]) -> None:
     if problems:
         raise ValueError(
             "Calibration data invalid:\n- " + "\n- ".join(problems) +
-            "\nExpected: 12 primitive runs (forward/strafe 12&36in, turn "
-            "45&135deg, each at powers 0.4 & 0.7, no reps) and >=3 path poses "
-            "with >=2 reps each, logging raw final pose.")
+            "\nExpected: 12 primitive runs (frozen cells: forward/strafe "
+            "12&36in, turn 45&135deg, each at powers 0.4 & 0.7, no reps) and "
+            ">=3 path poses with >=2 reps each, logging raw final pose.")
 
 
 # --------------------------------------------------------------------------- #
